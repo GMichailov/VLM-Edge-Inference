@@ -12,7 +12,7 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description="VLM Edge Inference")
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--model", type=str, required=True)
@@ -21,8 +21,6 @@ def main():
     parser.add_argument("--use_chat_template", type=bool, default=True)
     parser.add_argument("--max_ram_usage", type=float, default=None, help="Max RAM usage in GB")
     args = parser.parse_args()
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     if not args.prompt:
         parser.error("--prompt must not be empty")
@@ -53,9 +51,20 @@ def main():
         logger.warning("Requested %.1f GB exceeds 80%% of system RAM (%.1f GB), capping", args.max_ram_usage, cap_gb)
         args.max_ram_usage = cap_gb
 
-    from inference.tokenize import tokenize
+    return args
 
-    tokenize(model_dir, args.prompt, args.use_chat_template)
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    model_dir = MODELS_DIR / args.model
+
+    from inference.engine import InferenceEngine
+    engine = InferenceEngine(
+        model_dir, args.prompt, args.image_height, args.image_width, args.use_chat_template
+    )
+    engine.inference()
 
 
 if __name__ == "__main__":

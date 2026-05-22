@@ -11,9 +11,13 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 logger = logging.getLogger(__name__)
 
+_COMPOSITE_MODULES = frozenset({
+    "Qwen3_5DecoderLayer", "Qwen3_5VisionBlock", "Qwen3_5VisionModel",
+    "Qwen3_5TextModel", "Qwen3_5Model", "Qwen3_5ForConditionalGeneration",
+})
+
 
 def _extract_tensors(obj):
-    """Recursively find all tensors in a nested structure."""
     if isinstance(obj, torch.Tensor):
         return [obj]
     if obj is None:
@@ -31,6 +35,169 @@ def _extract_tensors(obj):
     return []
 
 
+def _add(overhead, dtype_str, count):
+    if count > 0:
+        overhead[dtype_str] = overhead.get(dtype_str, 0) + count
+
+
+def _add_attention_intermediates(overhead, module, input_tensors):
+    # Text standard attention: GQA + attn_output_gate + SDPA on CPU
+    num_heads = getattr(module, "num_heads", None)
+    head_dim = getattr(module, "head_dim", None)
+    num_kv_heads = getattr(module, "num_key_value_heads", num_heads)
+    if num_heads is None or head_dim is None:
+        return
+
+    B, S = input_tensors[0].shape[0], input_tensors[0].shape[1]
+    dtype_str = str(input_tensors[0].dtype)
+    fp32 = "torch.float32"
+
+    # Projection outputs
+    _add(overhead, dtype_str, B * S * 2 * num_heads * head_dim)      # q_proj (fused Q+gate)
+    _add(overhead, dtype_str, B * S * num_kv_heads * head_dim)       # k_proj
+    _add(overhead, dtype_str, B * S * num_kv_heads * head_dim)       # v_proj
+
+    # GQA expansion (repeat_kv materialises new tensors)
+    _add(overhead, dtype_str, B * num_heads * S * head_dim)          # K expanded
+    _add(overhead, dtype_str, B * num_heads * S * head_dim)          # V expanded
+
+    # SDPA float32 intermediates (CPU math backend upcasts bf16)
+    _add(overhead, fp32, 3 * B * num_heads * S * head_dim)           # Q, K, V upcast
+    _add(overhead, fp32, B * num_heads * S * S)                      # attention scores
+    _add(overhead, fp32, B * num_heads * S * S)                      # softmax
+    _add(overhead, fp32, B * num_heads * S * head_dim)               # softmax @ V
+    _add(overhead, dtype_str, B * num_heads * S * head_dim)          # cast back to bf16
+
+    # Gate: sigmoid output and element-wise multiply
+    _add(overhead, dtype_str, B * S * num_heads * head_dim)          # sigmoid(gate)
+    _add(overhead, dtype_str, B * num_heads * S * head_dim)          # o_proj input (reshaped attn_output)
+
+
+def _add_vision_attention_intermediates(overhead, module, input_tensors):
+    # Vision attention: no batch dim in inputs, no GQA, no gate, SDPA on CPU
+    num_heads = getattr(module, "num_heads", None)
+    head_dim = getattr(module, "head_dim", None)
+    if num_heads is None or head_dim is None:
+        return
+
+    S = input_tensors[0].shape[0]
+    H_vis = input_tensors[0].shape[1]
+    B = 1  # added internally
+    dtype_str = str(input_tensors[0].dtype)
+    fp32 = "torch.float32"
+
+    # Fused QKV projection output
+    _add(overhead, dtype_str, S * 3 * H_vis)
+
+    # SDPA float32 intermediates
+    _add(overhead, fp32, 3 * B * num_heads * S * head_dim)
+    _add(overhead, fp32, B * num_heads * S * S)
+    _add(overhead, fp32, B * num_heads * S * S)
+    _add(overhead, fp32, B * num_heads * S * head_dim)
+    _add(overhead, dtype_str, B * num_heads * S * head_dim)          # cast back
+
+
+def _add_deltanet_intermediates(overhead, module, input_tensors):
+    # Linear attention: no SDPA, all intermediates stay in native dtype
+    B, S = input_tensors[0].shape[0], input_tensors[0].shape[1]
+    dtype_str = str(input_tensors[0].dtype)
+
+    param_dims = {}
+    for name, p in module.named_parameters():
+        if name in ("in_proj_qkv.weight", "in_proj_z.weight",
+                     "in_proj_b.weight", "in_proj_a.weight"):
+            param_dims[name] = p.shape[0]
+
+    if "in_proj_qkv.weight" in param_dims:
+        qkv_dim = param_dims["in_proj_qkv.weight"]
+        _add(overhead, dtype_str, B * S * qkv_dim)                  # qkv projection
+        _add(overhead, dtype_str, B * S * qkv_dim)                  # conv1d output
+    if "in_proj_z.weight" in param_dims:
+        _add(overhead, dtype_str, B * S * param_dims["in_proj_z.weight"])
+    if "in_proj_b.weight" in param_dims:
+        _add(overhead, dtype_str, B * S * param_dims["in_proj_b.weight"])
+    if "in_proj_a.weight" in param_dims:
+        _add(overhead, dtype_str, B * S * param_dims["in_proj_a.weight"])
+
+    # Gated norm output / out_proj input (z_dim if present)
+    if "in_proj_z.weight" in param_dims:
+        _add(overhead, dtype_str, B * S * param_dims["in_proj_z.weight"])
+
+
+def _add_mlp_intermediates(overhead, module, input_tensors):
+    # SwiGLU: gate_proj -> SiLU -> * up_proj -> down_proj
+    B, S = input_tensors[0].shape[0], input_tensors[0].shape[1]
+    dtype_str = str(input_tensors[0].dtype)
+
+    intermediate_size = None
+    for name, p in module.named_parameters():
+        if name == "gate_proj.weight":
+            intermediate_size = p.shape[0]
+            break
+    if intermediate_size is None:
+        return
+
+    _add(overhead, dtype_str, B * S * intermediate_size)            # gate_proj(x)
+    _add(overhead, dtype_str, B * S * intermediate_size)            # SiLU(gate)
+    _add(overhead, dtype_str, B * S * intermediate_size)            # up_proj(x)
+    _add(overhead, dtype_str, B * S * intermediate_size)            # gate * up
+
+
+def _add_vision_mlp_intermediates(overhead, module, input_tensors):
+    # GELU MLP: linear_fc1 -> GELU -> linear_fc2 (no batch dim)
+    S = input_tensors[0].shape[0]
+    dtype_str = str(input_tensors[0].dtype)
+
+    intermediate_size = None
+    for name, p in module.named_parameters():
+        if name == "linear_fc1.weight":
+            intermediate_size = p.shape[0]
+            break
+    if intermediate_size is None:
+        return
+
+    _add(overhead, dtype_str, S * intermediate_size)                # linear_fc1(x)
+    _add(overhead, dtype_str, S * intermediate_size)                # GELU(fc1)
+
+
+def _add_intermediates(overhead, module, input_tensors):
+    cls_name = module.__class__.__name__
+    try:
+        if cls_name == "Qwen3_5Attention":
+            _add_attention_intermediates(overhead, module, input_tensors)
+        elif cls_name == "Qwen3_5VisionAttention":
+            _add_vision_attention_intermediates(overhead, module, input_tensors)
+        elif cls_name == "Qwen3_5GatedDeltaNet":
+            _add_deltanet_intermediates(overhead, module, input_tensors)
+        elif cls_name == "Qwen3_5MLP":
+            _add_mlp_intermediates(overhead, module, input_tensors)
+        elif cls_name == "Qwen3_5VisionMLP":
+            _add_vision_mlp_intermediates(overhead, module, input_tensors)
+    except Exception as e:
+        logger.warning("Failed to compute intermediates for %s (%s): %s",
+                       module, cls_name, e)
+
+
+def _compute_overhead(module, input_tensors, output_tensors):
+    if module.__class__.__name__ in _COMPOSITE_MODULES:
+        return {}
+
+    overhead = {}
+
+    for t in input_tensors:
+        _add(overhead, str(t.dtype), t.numel())
+
+    for p in module.parameters():
+        _add(overhead, str(p.dtype), p.numel())
+
+    for t in output_tensors:
+        _add(overhead, str(t.dtype), t.numel())
+
+    _add_intermediates(overhead, module, input_tensors)
+
+    return overhead
+
+
 def _make_hook(name, log, counter):
     def hook(module, args, kwargs, output):
         counter[0] += 1
@@ -38,14 +205,19 @@ def _make_hook(name, log, counter):
         input_tensors = _extract_tensors(args) + _extract_tensors(kwargs)
         output_tensors = _extract_tensors(output)
 
-        log.append({
-            "execution_order": counter[0],
+        entry = {
             "module_name": name,
             "module_class": module.__class__.__name__,
-            "inputs": [{"shape": list(t.shape), "dtype": str(t.dtype)} for t in input_tensors],
-            "outputs": [{"shape": list(t.shape), "dtype": str(t.dtype), "device": str(t.device)} for t in output_tensors],
-            "parameters": [{"name": n, "shape": list(p.shape)} for n, p in module.named_parameters()],
-        })
+            "inputs": [{"id": id(t), "shape": list(t.shape), "dtype": str(t.dtype)} for t in input_tensors],
+            "outputs": [{"id": id(t), "shape": list(t.shape), "dtype": str(t.dtype), "device": str(t.device)} for t in output_tensors],
+            "parameters": [{"name": n, "shape": list(p.shape), "dtype": str(p.dtype)} for n, p in module.named_parameters()],
+        }
+
+        overhead = _compute_overhead(module, input_tensors, output_tensors)
+        if overhead:
+            entry["overhead"] = overhead
+
+        log[counter[0]] = entry
 
     return hook
 
@@ -71,7 +243,7 @@ def main():
     )
     model.eval()
 
-    log = []
+    log = {}
     counter = [0]
     hooks = []
     for name, module in model.named_modules():

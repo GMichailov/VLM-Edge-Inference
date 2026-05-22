@@ -33,7 +33,7 @@ class InferenceEngine:
 
         self.embedding_step = None
         for order_str, entry in trace.items():
-            if entry["module_class"] == "Embedding" and "embed_tokens" in entry["module_name"]:
+            if entry["module_name"] == "model.language_model.embed_token":
                 self.embedding_step = int(order_str)
                 break
 

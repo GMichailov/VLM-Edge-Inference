@@ -3,3 +3,4 @@ models/*
 logs/*
 .vscode
 **/__pycache__
+images/*

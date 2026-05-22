@@ -1,6 +1,7 @@
 """Trace every module's forward pass: shapes, dtypes, parameters, execution order."""
 
 import argparse
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -198,6 +199,22 @@ def _compute_overhead(module, input_tensors, output_tensors):
     return overhead
 
 
+def _get_forward_kwargs(module):
+    """Extract kwarg names and defaults from a module's forward signature."""
+    try:
+        sig = inspect.signature(module.forward)
+    except (ValueError, TypeError):
+        return {}
+    kwargs = {}
+    for p in sig.parameters.values():
+        if p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD):
+            continue
+        if p.name == "self":
+            continue
+        kwargs[p.name] = None if p.default is p.empty else p.default
+    return kwargs
+
+
 def _make_hook(name, log, counter):
     def hook(module, args, kwargs, output):
         counter[0] += 1
@@ -208,6 +225,7 @@ def _make_hook(name, log, counter):
         entry = {
             "module_name": name,
             "module_class": module.__class__.__name__,
+            "forward_args": _get_forward_kwargs(module),
             "inputs": [{"id": id(t), "shape": list(t.shape), "dtype": str(t.dtype)} for t in input_tensors],
             "outputs": [{"id": id(t), "shape": list(t.shape), "dtype": str(t.dtype), "device": str(t.device)} for t in output_tensors],
             "parameters": [{"name": n, "shape": list(p.shape), "dtype": str(p.dtype)} for n, p in module.named_parameters()],

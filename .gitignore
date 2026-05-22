@@ -2,3 +2,4 @@ Implementation_plan.md
 models/*
 logs/*
 .vscode
+**/__pycache__

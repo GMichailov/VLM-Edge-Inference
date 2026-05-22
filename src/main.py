@@ -9,6 +9,7 @@ import psutil
 logger = logging.getLogger(__name__)
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
 
 def main():
@@ -30,6 +31,13 @@ def main():
     if not model_dir.exists():
         parser.error(f"Model not found: {model_dir}")
 
+    trace_path = LOGS_DIR / f"{args.model}_trace.json"
+    save_path = LOGS_DIR / f"{args.model}.saveTensors"
+    if not trace_path.exists():
+        parser.error(f"Trace not found: {trace_path} (run generate_architecture_report.py first)")
+    if not save_path.exists():
+        parser.error(f"Save plan not found: {save_path} (run create_inference_plan.py first)")
+
     if args.image_height > 480:
         logger.warning("Clamping image_height to 480")
         args.image_height = 480
@@ -44,6 +52,10 @@ def main():
     elif args.max_ram_usage > cap_gb:
         logger.warning("Requested %.1f GB exceeds 80%% of system RAM (%.1f GB), capping", args.max_ram_usage, cap_gb)
         args.max_ram_usage = cap_gb
+
+    from inference.tokenize import tokenize
+
+    tokenize(model_dir, args.prompt, args.use_chat_template)
 
 
 if __name__ == "__main__":
